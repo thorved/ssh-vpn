@@ -1,0 +1,14 @@
+.git
+.github
+
+backend/tmp
+backend/data
+
+.env
+.env.local
+.env.*.local
+backend/.env
+
+*.log
+Thumbs.db
+.DS_Store

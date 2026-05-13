@@ -1,0 +1,12 @@
+services:
+  ssh-vpn:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    ports:
+      - "2222:2222"
+    volumes:
+      - ./backend/data:/app/data
+    environment:
+      SSH_HOST_KEY_PATH: /app/data/host_key
+    restart: unless-stopped
