@@ -16,3 +16,4 @@ go.work.sum
 backend/data/
 backend/tmp/
 ssh
+data

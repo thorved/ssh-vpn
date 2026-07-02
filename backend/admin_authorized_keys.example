@@ -1,0 +1,3 @@
+# Replace this with one or more admin SSH public keys.
+# Example:
+# ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIFakeExampleKeyOnlyDoNotUse admin@example

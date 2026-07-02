@@ -10,19 +10,24 @@ import (
 	"io"
 	"log"
 	"net"
+	"net/http"
 	"os"
 	"path/filepath"
 	"strings"
 	"sync"
 
+	"github.com/thorved/ssh-vpn/backend/internal/admin"
 	"github.com/thorved/ssh-vpn/backend/internal/config"
+	"github.com/thorved/ssh-vpn/backend/internal/sshauth"
 	"golang.org/x/crypto/ssh"
 )
 
 type Server struct {
-	cfg      config.Config
-	signer   ssh.Signer
-	registry *Registry
+	cfg          config.Config
+	signer       ssh.Signer
+	registry     *Registry
+	adminKeys    *sshauth.AuthorizedKeys
+	adminHandler http.Handler
 
 	mu       sync.Mutex
 	listener net.Listener
@@ -59,18 +64,26 @@ func NewServer(cfg config.Config) (*Server, error) {
 	if err != nil {
 		return nil, err
 	}
+	adminKeys, err := sshauth.LoadAuthorizedKeys(cfg.AdminAuthorizedKeysFile)
+	if err != nil {
+		return nil, err
+	}
 
-	return &Server{
-		cfg:      cfg,
-		signer:   signer,
-		registry: NewRegistry(),
-	}, nil
+	server := &Server{
+		cfg:       cfg,
+		signer:    signer,
+		registry:  NewRegistry(),
+		adminKeys: adminKeys,
+	}
+	server.adminHandler = admin.NewHandler(cfg, server.registry)
+	return server, nil
 }
 
 func (s *Server) Run() error {
 	serverConfig := &ssh.ServerConfig{
-		NoClientAuth:  true,
-		ServerVersion: s.cfg.SSHServerIdent,
+		NoClientAuth:         true,
+		NoClientAuthCallback: s.noClientAuth,
+		ServerVersion:        s.cfg.SSHServerIdent,
 	}
 	serverConfig.AddHostKey(s.signer)
 
@@ -127,12 +140,13 @@ func (s *Server) handleConn(nc net.Conn, serverConfig *ssh.ServerConfig) {
 		return
 	}
 
+	s.registry.RegisterConn(room, conn, nc.RemoteAddr())
 	state := &connState{}
 	log.Printf("room %q connected from %s", room, nc.RemoteAddr())
 	go s.handleGlobalRequests(room, conn, state, reqs)
 
 	for newCh := range chans {
-		go s.handleChannel(room, state, newCh)
+		go s.handleChannel(room, conn, state, newCh)
 	}
 }
 
@@ -193,10 +207,10 @@ func (s *Server) handleCancelTCPIPForward(room string, conn *ssh.ServerConn, sta
 	replyRequest(req, true, nil)
 }
 
-func (s *Server) handleChannel(room string, state *connState, newCh ssh.NewChannel) {
+func (s *Server) handleChannel(room string, conn *ssh.ServerConn, state *connState, newCh ssh.NewChannel) {
 	switch newCh.ChannelType() {
 	case "direct-tcpip":
-		if err := s.handleDirectTCPIP(room, newCh); err != nil {
+		if err := s.handleDirectTCPIP(room, conn, newCh); err != nil {
 			log.Printf("direct-tcpip error for room %q: %v", room, err)
 		}
 	case "session":
@@ -206,11 +220,15 @@ func (s *Server) handleChannel(room string, state *connState, newCh ssh.NewChann
 	}
 }
 
-func (s *Server) handleDirectTCPIP(room string, newCh ssh.NewChannel) error {
+func (s *Server) handleDirectTCPIP(room string, conn *ssh.ServerConn, newCh ssh.NewChannel) error {
 	var payload directTCPIPPayload
 	if err := ssh.Unmarshal(newCh.ExtraData(), &payload); err != nil {
 		_ = newCh.Reject(ssh.ConnectionFailed, "invalid direct-tcpip payload")
 		return err
+	}
+
+	if s.isAdminDashboardRequest(room, payload.Port) {
+		return s.serveAdminHTTP(newCh)
 	}
 
 	publisher, err := s.registry.Lookup(room, payload.Port)
@@ -241,8 +259,14 @@ func (s *Server) handleDirectTCPIP(room string, newCh ssh.NewChannel) error {
 		return err
 	}
 
+	doneForward := s.registry.BeginForward(conn, publisher.Conn)
+	defer doneForward()
 	bridgeChannels(localCh, localReqs, remoteCh, remoteReqs)
 	return nil
+}
+
+func (s *Server) isAdminDashboardRequest(room string, port uint32) bool {
+	return room == s.cfg.AdminUser && port == s.cfg.AdminDashboardPort
 }
 
 func (s *Server) handleSession(state *connState, newCh ssh.NewChannel) {
