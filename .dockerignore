@@ -3,6 +3,7 @@
 
 backend/tmp
 backend/data
+data
 
 .env
 .env.local

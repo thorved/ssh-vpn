@@ -1,86 +1,108 @@
 # SSH VPN
 
-Minimal SSH forwarding broker for sharing a local TCP port through a named room.
+A small SSH forwarding broker for sharing TCP ports through named rooms. Operators manage live rooms, connections, and forwards through a native terminal dashboard served directly over SSH—there is no frontend, HTTP server, database, or additional public port.
 
-This project intentionally has no frontend, database, password auth, public key auth, or admin API in the first version. The SSH username is the room name.
+## Tunnel usage
 
-## Example
-
-Machine A publishes its local port `8080` into room `roomname`:
-
-```bash
-ssh -R 8080:localhost:8080 roomname@serverip -p 2222
-```
-
-Machine B opens a local port `8080` through the same room:
-
-```bash
-ssh -L 8080:localhost:8080 roomname@serverip -p 2222
-```
-
-After both sessions are connected, traffic to `localhost:8080` on machine B is forwarded to `localhost:8080` on machine A.
-
-For forwarding-only sessions, use `-N`:
+Machine A publishes local port `8080` into `roomname`:
 
 ```bash
 ssh -N -R 8080:localhost:8080 roomname@serverip -p 2222
+```
+
+Machine B connects its local port `8080` to the same room:
+
+```bash
 ssh -N -L 8080:localhost:8080 roomname@serverip -p 2222
 ```
 
-## Behavior
+Traffic sent to `localhost:8080` on Machine B is forwarded to Machine A. Room users remain authentication-free; use network controls when exposing the service.
 
-- Room names come from the SSH username, such as `roomname@serverip`.
-- Published ports are isolated by room.
-- `room-a:8080` and `room-b:8080` can exist at the same time.
-- A second publisher for the same room and port is rejected while the first publisher is connected.
-- Publishers are removed when their SSH connection closes or sends `cancel-tcpip-forward`.
+## Admin dashboard
 
-## Local Development
+The configured admin username requires an authorized public key and opens the dashboard immediately:
 
-```powershell
-cd backend
-go mod tidy
-go run ./cmd/server
+```bash
+ssh -t -i ~/.ssh/id_ed25519 root@serverip -p 2222
 ```
 
-The server listens on SSH port `2222` by default.
+The dashboard includes:
+
+- Live totals for rooms, connections, published forwards, and active channels.
+- Searchable room, connection, and forward inventories with detailed ownership and activity.
+- Confirmed actions to remove a room, disconnect a connection, or remove a forward.
+- Event-driven updates with a periodic refresh fallback.
+- Mouse-enabled tabs, row selection, scrolling, toolbar actions, and confirmation buttons in compatible terminals.
+
+Use `Tab` or `1`–`4` to change views, arrows or `j`/`k` to move, `/` to search, `d` to remove the selected item, `r` to refresh, `?` for help, and `q` to exit. Admin sessions are control-plane only: they never appear as rooms and cannot publish or consume forwards.
+
+Removing a forward disconnects its owning SSH connection, ending its active traffic and every other forward owned by that connection. Each destructive action shows its impact before asking for confirmation.
+
+## Admin keys
+
+Create `data/admin_authorized_keys` and add one or more OpenSSH public keys. A safe template is tracked at `data/admin_authorized_keys.example`:
+
+```text
+ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAA... operator-a
+ssh-rsa AAAAB3NzaC1yc2EAAAADAQABAAABAQ... operator-b
+```
+
+Comments and blank lines are supported. If `ADMIN_AUTHORIZED_KEYS_FILE` is empty, the tunnel server still starts but admin login is disabled. If a non-empty path is unreadable or contains an invalid entry, startup fails so a broken security configuration is visible immediately.
+
+## Configuration
+
+Copy `.env.example` to `.env` and adjust it:
+
+| Variable | Default | Description |
+| --- | --- | --- |
+| `SSH_PORT` | `2222` | Listener port when `SSH_LISTEN_ADDR` is unset. |
+| `SSH_LISTEN_ADDR` | `:2222` | Full SSH listen address. |
+| `SSH_HOST_KEY_PATH` | empty | Persisted server host key. An empty value generates an in-memory key on each start. |
+| `SSH_SERVER_IDENT` | `SSH-2.0-ssh-vpn` | SSH server identification string. |
+| `ADMIN_USER` | `root` | Username reserved for the terminal dashboard. |
+| `ADMIN_AUTHORIZED_KEYS_FILE` | empty | OpenSSH authorized-keys file required by the admin user. |
+
+Normal usernames continue to identify rooms and do not require keys. The configured admin username is reserved and cannot be used as a tunnel room.
+
+## Local development
+
+From the repository root:
+
+```powershell
+Copy-Item .env.example .env
+Copy-Item data/admin_authorized_keys.example data/admin_authorized_keys
+go -C backend build -o server ./cmd/server
+./backend/server
+```
+
+Replace the placeholder key before starting. The process loads `.env` from its working directory, or `backend/.env` when run from `backend`.
 
 ## Docker
+
+Place real admin public keys in `data/admin_authorized_keys`, then run:
 
 ```powershell
 docker compose up -d --build
 ```
 
-Published ports:
+Compose exposes only SSH on port `2222`. The repository-root `data` directory is mounted at `/app/data` for the generated host key and admin authorized-keys file. Real files under `data/` are ignored by Git; only the safe `.example` template is tracked.
 
-- SSH tunnel broker: `:2222`
+## Behavior and security
 
-Persistent data is mounted from `backend/data` to `/app/data`. The Docker image stores the SSH host key at `/app/data/host_key`.
-
-## Configuration
-
-| Variable | Default | Description |
-| --- | --- | --- |
-| `SSH_PORT` | `2222` | Port used when `SSH_LISTEN_ADDR` is not set. |
-| `SSH_LISTEN_ADDR` | `:2222` | Full TCP listen address for the SSH server. |
-| `SSH_HOST_KEY_PATH` | empty | Path to a persisted SSH host key. If empty, an in-memory key is generated on each start. |
-| `SSH_SERVER_IDENT` | `SSH-2.0-ssh-vpn` | SSH server identification string. |
-
-## Security Warning
-
-This first version uses `NoClientAuth: true`, so anyone who can reach the SSH port can create or join any room. Do not expose it publicly without network controls such as a firewall, private network, or reverse proxy access policy.
+- Room names come from SSH usernames.
+- Published ports are isolated by room, so different rooms can use the same port.
+- A second publisher for the same room and port is rejected while the first is connected.
+- A connection attempting to publish an already-owned room/port is rejected and disconnected; the existing publisher stays online.
+- Publishers disappear when their SSH connection closes or cancels the remote forward.
+- Admin authentication protects only the reserved admin username; ordinary rooms intentionally use `NoClientAuth`.
+- Do not expose the broker publicly without a firewall, private network, or equivalent access policy.
 
 ## Verification
 
-Backend:
-
 ```powershell
-cd backend
-go test ./...
-```
-
-Docker:
-
-```powershell
+go -C backend test ./...
+go -C backend test -race ./...
+go -C backend vet ./...
+go -C backend build ./cmd/server
 docker compose build
 ```

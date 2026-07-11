@@ -6,7 +6,9 @@ services:
     ports:
       - "2222:2222"
     volumes:
-      - ./backend/data:/app/data
+      - ./data:/app/data
     environment:
       SSH_HOST_KEY_PATH: /app/data/host_key
+      ADMIN_USER: ${ADMIN_USER:-root}
+      ADMIN_AUTHORIZED_KEYS_FILE: /app/data/admin_authorized_keys
     restart: unless-stopped

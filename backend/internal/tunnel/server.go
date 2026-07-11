@@ -16,13 +16,15 @@ import (
 	"sync"
 
 	"github.com/thorved/ssh-vpn/backend/internal/config"
+	"github.com/thorved/ssh-vpn/backend/internal/sshauth"
 	"golang.org/x/crypto/ssh"
 )
 
 type Server struct {
-	cfg      config.Config
-	signer   ssh.Signer
-	registry *Registry
+	cfg       config.Config
+	signer    ssh.Signer
+	registry  *Registry
+	adminKeys *sshauth.AuthorizedKeys
 
 	mu       sync.Mutex
 	listener net.Listener
@@ -60,17 +62,24 @@ func NewServer(cfg config.Config) (*Server, error) {
 		return nil, err
 	}
 
+	adminKeys, err := sshauth.LoadAuthorizedKeys(cfg.AdminAuthorizedKeysFile)
+	if err != nil {
+		return nil, err
+	}
+
 	return &Server{
-		cfg:      cfg,
-		signer:   signer,
-		registry: NewRegistry(),
+		cfg:       cfg,
+		signer:    signer,
+		registry:  NewRegistry(),
+		adminKeys: adminKeys,
 	}, nil
 }
 
 func (s *Server) Run() error {
 	serverConfig := &ssh.ServerConfig{
-		NoClientAuth:  true,
-		ServerVersion: s.cfg.SSHServerIdent,
+		NoClientAuth:         true,
+		NoClientAuthCallback: s.noClientAuth,
+		ServerVersion:        s.cfg.SSHServerIdent,
 	}
 	serverConfig.AddHostKey(s.signer)
 
@@ -115,24 +124,33 @@ func (s *Server) handleConn(nc net.Conn, serverConfig *ssh.ServerConfig) {
 		return
 	}
 	defer conn.Close()
-	defer func() {
-		if removed := s.registry.UnregisterConn(conn); removed > 0 {
-			log.Printf("cleaned up %d publisher(s) for room %q", removed, conn.User())
-		}
-	}()
-
 	room := strings.TrimSpace(conn.User())
 	if room == "" {
 		log.Printf("ssh connection from %s missing room name", nc.RemoteAddr())
 		return
 	}
 
+	if room == s.cfg.AdminUser {
+		log.Printf("admin connected from %s", nc.RemoteAddr())
+		go rejectGlobalRequests(reqs)
+		for newCh := range chans {
+			go s.handleAdminChannel(newCh)
+		}
+		return
+	}
+
+	defer func() {
+		if removed := s.registry.UnregisterConn(conn); removed > 0 {
+			log.Printf("cleaned up %d publisher(s) for room %q", removed, conn.User())
+		}
+	}()
+	s.registry.RegisterConn(room, conn, nc.RemoteAddr())
 	state := &connState{}
 	log.Printf("room %q connected from %s", room, nc.RemoteAddr())
 	go s.handleGlobalRequests(room, conn, state, reqs)
 
 	for newCh := range chans {
-		go s.handleChannel(room, state, newCh)
+		go s.handleChannel(room, conn, state, newCh)
 	}
 }
 
@@ -166,8 +184,13 @@ func (s *Server) handleTCPIPForward(room string, conn *ssh.ServerConn, state *co
 	})
 	if err != nil {
 		log.Printf("tcpip-forward rejected for room %q port %d: %v", room, payload.BindPort, err)
-		state.notify("remote forward rejected: room %q port %d is already published", room, payload.BindPort)
 		replyRequest(req, false, nil)
+		if errors.Is(err, ErrPublisherExists) {
+			state.notify("remote forward rejected: room %q port %d is already published; disconnecting", room, payload.BindPort)
+			_ = conn.Close()
+			return
+		}
+		state.notify("remote forward rejected: %v", err)
 		return
 	}
 
@@ -193,10 +216,10 @@ func (s *Server) handleCancelTCPIPForward(room string, conn *ssh.ServerConn, sta
 	replyRequest(req, true, nil)
 }
 
-func (s *Server) handleChannel(room string, state *connState, newCh ssh.NewChannel) {
+func (s *Server) handleChannel(room string, conn *ssh.ServerConn, state *connState, newCh ssh.NewChannel) {
 	switch newCh.ChannelType() {
 	case "direct-tcpip":
-		if err := s.handleDirectTCPIP(room, newCh); err != nil {
+		if err := s.handleDirectTCPIP(room, conn, newCh); err != nil {
 			log.Printf("direct-tcpip error for room %q: %v", room, err)
 		}
 	case "session":
@@ -206,7 +229,7 @@ func (s *Server) handleChannel(room string, state *connState, newCh ssh.NewChann
 	}
 }
 
-func (s *Server) handleDirectTCPIP(room string, newCh ssh.NewChannel) error {
+func (s *Server) handleDirectTCPIP(room string, receiver *ssh.ServerConn, newCh ssh.NewChannel) error {
 	var payload directTCPIPPayload
 	if err := ssh.Unmarshal(newCh.ExtraData(), &payload); err != nil {
 		_ = newCh.Reject(ssh.ConnectionFailed, "invalid direct-tcpip payload")
@@ -241,8 +264,16 @@ func (s *Server) handleDirectTCPIP(room string, newCh ssh.NewChannel) error {
 		return err
 	}
 
+	doneForward := s.registry.BeginForward(receiver, publisher)
+	defer doneForward()
 	bridgeChannels(localCh, localReqs, remoteCh, remoteReqs)
 	return nil
+}
+
+func rejectGlobalRequests(reqs <-chan *ssh.Request) {
+	for req := range reqs {
+		replyRequest(req, false, nil)
+	}
 }
 
 func (s *Server) handleSession(state *connState, newCh ssh.NewChannel) {

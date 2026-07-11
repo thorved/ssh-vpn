@@ -16,3 +16,5 @@ go.work.sum
 backend/data/
 backend/tmp/
 ssh
+data/*
+!data/admin_authorized_keys.example

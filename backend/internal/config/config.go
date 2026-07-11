@@ -6,16 +6,20 @@ import (
 )
 
 type Config struct {
-	SSHListenAddr  string
-	SSHHostKeyPath string
-	SSHServerIdent string
+	SSHListenAddr           string
+	SSHHostKeyPath          string
+	SSHServerIdent          string
+	AdminUser               string
+	AdminAuthorizedKeysFile string
 }
 
 func MustLoad() Config {
 	return Config{
-		SSHListenAddr:  sshListenAddr(),
-		SSHHostKeyPath: strings.TrimSpace(os.Getenv("SSH_HOST_KEY_PATH")),
-		SSHServerIdent: envOr("SSH_SERVER_IDENT", "SSH-2.0-ssh-vpn"),
+		SSHListenAddr:           sshListenAddr(),
+		SSHHostKeyPath:          strings.TrimSpace(os.Getenv("SSH_HOST_KEY_PATH")),
+		SSHServerIdent:          envOr("SSH_SERVER_IDENT", "SSH-2.0-ssh-vpn"),
+		AdminUser:               envOr("ADMIN_USER", "root"),
+		AdminAuthorizedKeysFile: strings.TrimSpace(os.Getenv("ADMIN_AUTHORIZED_KEYS_FILE")),
 	}
 }
 

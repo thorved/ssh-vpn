@@ -1,0 +1,2 @@
+# Add one or more OpenSSH public keys. Blank lines and comments are allowed.
+# ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAA... workstation
