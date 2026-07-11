@@ -4,6 +4,8 @@ import (
 	"bytes"
 	"crypto/ed25519"
 	"crypto/rand"
+	"io"
+	"net"
 	"os"
 	"path/filepath"
 	"strings"
@@ -136,6 +138,120 @@ func TestDuplicatePublisherDisconnectsOnlyOffendingConnection(t *testing.T) {
 	t.Fatalf("existing publisher was not preserved: %#v", server.registry.Snapshot().Totals)
 }
 
+func TestRoomUserOpensRoleDashboard(t *testing.T) {
+	server, err := NewServer(config.Config{SSHListenAddr: "127.0.0.1:0", SSHServerIdent: "SSH-2.0-test", AdminUser: "root"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	done := make(chan error, 1)
+	go func() { done <- server.Run() }()
+	t.Cleanup(func() { _ = server.Shutdown(); <-done })
+	client, err := ssh.Dial("tcp", waitForListener(t, server), &ssh.ClientConfig{User: "room-a", HostKeyCallback: ssh.InsecureIgnoreHostKey(), Timeout: 2 * time.Second})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer client.Close()
+	session, err := client.NewSession()
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer session.Close()
+	var output lockedBuffer
+	session.Stdout, session.Stderr = &output, &output
+	if err := session.RequestPty("xterm-256color", 30, 110, ssh.TerminalModes{}); err != nil {
+		t.Fatal(err)
+	}
+	if err := session.Shell(); err != nil {
+		t.Fatal(err)
+	}
+	waitForOutput(t, &output, "SSH VPN", "room-a", "CONNECTED", "\x1b[38;5;")
+}
+
+func TestPublisherCanKickClientFromRoleDashboard(t *testing.T) {
+	server, err := NewServer(config.Config{SSHListenAddr: "127.0.0.1:0", SSHServerIdent: "SSH-2.0-test", AdminUser: "root"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	done := make(chan error, 1)
+	go func() { done <- server.Run() }()
+	t.Cleanup(func() { _ = server.Shutdown(); <-done })
+	addr := waitForListener(t, server)
+	roomConfig := &ssh.ClientConfig{User: "room-live", HostKeyCallback: ssh.InsecureIgnoreHostKey(), Timeout: 2 * time.Second}
+
+	publisher, err := ssh.Dial("tcp", addr, roomConfig)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer publisher.Close()
+	listener, err := publisher.Listen("tcp", "localhost:48082")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer listener.Close()
+	pubSession, pubInput, pubOutput := openRoleSession(t, publisher)
+	defer pubSession.Close()
+	waitForOutput(t, pubOutput, "PUBLISHER", "48082")
+
+	client, err := ssh.Dial("tcp", addr, roomConfig)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer client.Close()
+	clientSession, clientInput, clientOutput := openRoleSession(t, client)
+	defer clientSession.Close()
+
+	accepted := make(chan net.Conn, 1)
+	go func() { conn, _ := listener.Accept(); accepted <- conn }()
+	clientTraffic, clientRequests, err := client.OpenChannel("direct-tcpip", ssh.Marshal(directTCPIPPayload{Host: "localhost", Port: 48082, OriginatorIP: "127.0.0.1", OriginatorPort: 52000}))
+	if err != nil {
+		t.Fatal(err)
+	}
+	go ssh.DiscardRequests(clientRequests)
+	defer clientTraffic.Close()
+	publisherTraffic := <-accepted
+	if publisherTraffic == nil {
+		t.Fatal("publisher did not receive forwarded traffic")
+	}
+	defer publisherTraffic.Close()
+
+	_, _ = pubInput.Write([]byte("3"))
+	_, _ = clientInput.Write([]byte("3"))
+	waitForOutput(t, pubOutput, "FROM CLIENT")
+	waitForOutput(t, clientOutput, "TO PUBLISHER")
+
+	clientDone := make(chan error, 1)
+	go func() { clientDone <- client.Wait() }()
+	_, _ = pubInput.Write([]byte("d"))
+	time.Sleep(30 * time.Millisecond)
+	_, _ = pubInput.Write([]byte("y"))
+	select {
+	case <-clientDone:
+	case <-time.After(3 * time.Second):
+		t.Fatal("publisher kick did not close client SSH connection")
+	}
+}
+
+func openRoleSession(t *testing.T, client *ssh.Client) (*ssh.Session, io.WriteCloser, *lockedBuffer) {
+	t.Helper()
+	session, err := client.NewSession()
+	if err != nil {
+		t.Fatal(err)
+	}
+	input, err := session.StdinPipe()
+	if err != nil {
+		t.Fatal(err)
+	}
+	output := &lockedBuffer{}
+	session.Stdout, session.Stderr = output, output
+	if err := session.RequestPty("xterm-256color", 30, 110, ssh.TerminalModes{}); err != nil {
+		t.Fatal(err)
+	}
+	if err := session.Shell(); err != nil {
+		t.Fatal(err)
+	}
+	return session, input, output
+}
+
 func clientConfig(user string, signer ssh.Signer) *ssh.ClientConfig {
 	return &ssh.ClientConfig{User: user, Auth: []ssh.AuthMethod{ssh.PublicKeys(signer)}, HostKeyCallback: ssh.InsecureIgnoreHostKey(), Timeout: 2 * time.Second}
 }
@@ -167,6 +283,26 @@ func waitForListener(t *testing.T, server *Server) string {
 	}
 	t.Fatal("server did not start listening")
 	return ""
+}
+
+func waitForOutput(t *testing.T, output *lockedBuffer, values ...string) {
+	t.Helper()
+	deadline := time.Now().Add(3 * time.Second)
+	for time.Now().Before(deadline) {
+		text := output.String()
+		all := true
+		for _, value := range values {
+			if !strings.Contains(text, value) {
+				all = false
+				break
+			}
+		}
+		if all {
+			return
+		}
+		time.Sleep(20 * time.Millisecond)
+	}
+	t.Fatalf("terminal output missing %q; output=%q", values, output.String())
 }
 
 type lockedBuffer struct {

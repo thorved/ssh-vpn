@@ -2,6 +2,7 @@ package tunnel
 
 import (
 	"errors"
+	"io"
 	"net"
 	"sync"
 	"testing"
@@ -111,10 +112,75 @@ func TestRegistryConcurrentSnapshotAndMutation(t *testing.T) {
 	}
 }
 
+func TestUserSnapshotAndScopedControls(t *testing.T) {
+	r := NewRegistry()
+	publisherConn, receiverConn, strangerConn := testServerConn(), testServerConn(), testServerConn()
+	r.RegisterConn("room", publisherConn, testAddr("publisher:1000"))
+	r.RegisterConn("room", receiverConn, testAddr("receiver:2000"))
+	r.RegisterConn("room", strangerConn, testAddr("stranger:3000"))
+	publisher := &Publisher{Room: "room", BindHost: "localhost", Port: 8080, Conn: publisherConn}
+	if err := r.Register(publisher); err != nil {
+		t.Fatal(err)
+	}
+	local, remote := &fakeChannel{}, &fakeChannel{}
+	done := r.BeginForward(receiverConn, publisher, local, remote)
+	defer done()
+	localTwo, remoteTwo := &fakeChannel{}, &fakeChannel{}
+	doneTwo := r.BeginForward(receiverConn, publisher, localTwo, remoteTwo)
+	defer doneTwo()
+
+	pubView := r.UserSnapshot(publisherConn)
+	if pubView.Role != "publisher" || len(pubView.Published) != 1 || pubView.Published[0].ActiveClients != 1 || len(pubView.Activities) != 1 || pubView.Activities[0].ChannelCount != 2 || pubView.Activities[0].Direction != "incoming" || pubView.Activities[0].PeerAddress != "receiver:2000" {
+		t.Fatalf("unexpected publisher view: %#v", pubView)
+	}
+	receiverView := r.UserSnapshot(receiverConn)
+	if receiverView.Role != "receiver" || len(receiverView.Activities) != 1 || receiverView.Activities[0].ChannelCount != 2 || receiverView.Activities[0].Direction != "outgoing" || receiverView.Activities[0].PeerAddress != "publisher:1000" {
+		t.Fatalf("unexpected receiver view: %#v", receiverView)
+	}
+
+	if result := r.CloseUserActivity(strangerConn, pubView.Activities[0].ID); result.Found {
+		t.Fatal("unrelated connection managed activity")
+	}
+	if result := r.StopPublishing(strangerConn, 8080); result.Found {
+		t.Fatal("unrelated connection stopped publisher")
+	}
+	if result := r.CloseUserActivity(receiverConn, receiverView.Activities[0].ID); !result.Found {
+		t.Fatalf("receiver could not close grouped traffic: %#v", result)
+	}
+	if !local.isClosed() || !remote.isClosed() || !localTwo.isClosed() || !remoteTwo.isClosed() {
+		t.Fatal("receiver action did not close every grouped traffic channel")
+	}
+	if result := r.CloseUserActivity(publisherConn, pubView.Activities[0].ID); !result.Found {
+		t.Fatalf("publisher could not kick client: %#v", result)
+	}
+	if !receiverConn.Conn.(*fakeSSHConn).isClosed() {
+		t.Fatal("receiver SSH connection was not kicked")
+	}
+	if result := r.StopPublishing(publisherConn, 8080); !result.Found {
+		t.Fatalf("owner could not stop port: %#v", result)
+	}
+	if !local.isClosed() || !remote.isClosed() || !localTwo.isClosed() || !remoteTwo.isClosed() {
+		t.Fatal("stopping publisher did not close active traffic")
+	}
+}
+
 type fakeSSHConn struct {
 	mu     sync.Mutex
 	closed bool
 }
+
+type fakeChannel struct {
+	mu     sync.Mutex
+	closed bool
+}
+
+func (c *fakeChannel) Read([]byte) (int, error)                       { return 0, errors.New("closed") }
+func (c *fakeChannel) Write(p []byte) (int, error)                    { return len(p), nil }
+func (c *fakeChannel) Close() error                                   { c.mu.Lock(); c.closed = true; c.mu.Unlock(); return nil }
+func (c *fakeChannel) CloseWrite() error                              { return nil }
+func (c *fakeChannel) SendRequest(string, bool, []byte) (bool, error) { return false, nil }
+func (c *fakeChannel) Stderr() io.ReadWriter                          { return c }
+func (c *fakeChannel) isClosed() bool                                 { c.mu.Lock(); defer c.mu.Unlock(); return c.closed }
 
 func (f *fakeSSHConn) User() string                                           { return "test" }
 func (f *fakeSSHConn) SessionID() []byte                                      { return nil }

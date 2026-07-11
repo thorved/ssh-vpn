@@ -49,13 +49,6 @@ type forwardedTCPIPPayload struct {
 	OriginatorPort   uint32
 }
 
-type connState struct {
-	mu          sync.Mutex
-	session     ssh.Channel
-	pending     []string
-	statusShown bool
-}
-
 func NewServer(cfg config.Config) (*Server, error) {
 	signer, err := loadOrGenerateHostKey(cfg.SSHHostKeyPath)
 	if err != nil {
@@ -145,33 +138,31 @@ func (s *Server) handleConn(nc net.Conn, serverConfig *ssh.ServerConfig) {
 		}
 	}()
 	s.registry.RegisterConn(room, conn, nc.RemoteAddr())
-	state := &connState{}
 	log.Printf("room %q connected from %s", room, nc.RemoteAddr())
-	go s.handleGlobalRequests(room, conn, state, reqs)
+	go s.handleGlobalRequests(room, conn, reqs)
 
 	for newCh := range chans {
-		go s.handleChannel(room, conn, state, newCh)
+		go s.handleChannel(room, conn, newCh)
 	}
 }
 
-func (s *Server) handleGlobalRequests(room string, conn *ssh.ServerConn, state *connState, reqs <-chan *ssh.Request) {
+func (s *Server) handleGlobalRequests(room string, conn *ssh.ServerConn, reqs <-chan *ssh.Request) {
 	for req := range reqs {
 		switch req.Type {
 		case "tcpip-forward":
-			s.handleTCPIPForward(room, conn, state, req)
+			s.handleTCPIPForward(room, conn, req)
 		case "cancel-tcpip-forward":
-			s.handleCancelTCPIPForward(room, conn, state, req)
+			s.handleCancelTCPIPForward(room, conn, req)
 		default:
 			replyRequest(req, false, nil)
 		}
 	}
 }
 
-func (s *Server) handleTCPIPForward(room string, conn *ssh.ServerConn, state *connState, req *ssh.Request) {
+func (s *Server) handleTCPIPForward(room string, conn *ssh.ServerConn, req *ssh.Request) {
 	var payload tcpipForwardPayload
 	if err := ssh.Unmarshal(req.Payload, &payload); err != nil {
 		log.Printf("invalid tcpip-forward request for room %q: %v", room, err)
-		state.notify("remote forward rejected: invalid request for room %q", room)
 		replyRequest(req, false, nil)
 		return
 	}
@@ -186,24 +177,20 @@ func (s *Server) handleTCPIPForward(room string, conn *ssh.ServerConn, state *co
 		log.Printf("tcpip-forward rejected for room %q port %d: %v", room, payload.BindPort, err)
 		replyRequest(req, false, nil)
 		if errors.Is(err, ErrPublisherExists) {
-			state.notify("remote forward rejected: room %q port %d is already published; disconnecting", room, payload.BindPort)
 			_ = conn.Close()
 			return
 		}
-		state.notify("remote forward rejected: %v", err)
 		return
 	}
 
 	log.Printf("registered publisher room=%q bind=%s:%d", room, payload.BindHost, payload.BindPort)
-	state.notify("remote forward ready: room %q port %d", room, payload.BindPort)
 	replyRequest(req, true, nil)
 }
 
-func (s *Server) handleCancelTCPIPForward(room string, conn *ssh.ServerConn, state *connState, req *ssh.Request) {
+func (s *Server) handleCancelTCPIPForward(room string, conn *ssh.ServerConn, req *ssh.Request) {
 	var payload tcpipForwardPayload
 	if err := ssh.Unmarshal(req.Payload, &payload); err != nil {
 		log.Printf("invalid cancel-tcpip-forward request for room %q: %v", room, err)
-		state.notify("remote forward cancel failed: invalid request for room %q", room)
 		replyRequest(req, false, nil)
 		return
 	}
@@ -211,19 +198,18 @@ func (s *Server) handleCancelTCPIPForward(room string, conn *ssh.ServerConn, sta
 	removed := s.registry.Unregister(room, payload.BindPort, conn)
 	if removed {
 		log.Printf("unregistered publisher room=%q bind=%s:%d", room, payload.BindHost, payload.BindPort)
-		state.notify("remote forward closed: room %q port %d", room, payload.BindPort)
 	}
 	replyRequest(req, true, nil)
 }
 
-func (s *Server) handleChannel(room string, conn *ssh.ServerConn, state *connState, newCh ssh.NewChannel) {
+func (s *Server) handleChannel(room string, conn *ssh.ServerConn, newCh ssh.NewChannel) {
 	switch newCh.ChannelType() {
 	case "direct-tcpip":
 		if err := s.handleDirectTCPIP(room, conn, newCh); err != nil {
 			log.Printf("direct-tcpip error for room %q: %v", room, err)
 		}
 	case "session":
-		s.handleSession(state, newCh)
+		s.handleUserSession(room, conn, newCh)
 	default:
 		_ = newCh.Reject(ssh.UnknownChannelType, "unsupported channel type")
 	}
@@ -264,7 +250,7 @@ func (s *Server) handleDirectTCPIP(room string, receiver *ssh.ServerConn, newCh 
 		return err
 	}
 
-	doneForward := s.registry.BeginForward(receiver, publisher)
+	doneForward := s.registry.BeginForward(receiver, publisher, localCh, remoteCh)
 	defer doneForward()
 	bridgeChannels(localCh, localReqs, remoteCh, remoteReqs)
 	return nil
@@ -274,72 +260,6 @@ func rejectGlobalRequests(reqs <-chan *ssh.Request) {
 	for req := range reqs {
 		replyRequest(req, false, nil)
 	}
-}
-
-func (s *Server) handleSession(state *connState, newCh ssh.NewChannel) {
-	ch, reqs, err := newCh.Accept()
-	if err != nil {
-		return
-	}
-	state.attachSession(ch)
-
-	go func() {
-		defer state.detachSession(ch)
-		defer ch.Close()
-		for req := range reqs {
-			switch req.Type {
-			case "pty-req", "shell", "exec":
-				replyRequest(req, true, nil)
-				state.showStatus()
-			default:
-				replyRequest(req, false, nil)
-			}
-		}
-	}()
-}
-
-func (s *connState) notify(format string, args ...any) {
-	message := fmt.Sprintf(format, args...) + "\n"
-
-	s.mu.Lock()
-	defer s.mu.Unlock()
-
-	if s.session == nil {
-		s.pending = append(s.pending, message)
-		return
-	}
-	_, _ = io.WriteString(s.session, message)
-}
-
-func (s *connState) attachSession(ch ssh.Channel) {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-
-	s.session = ch
-	for _, message := range s.pending {
-		_, _ = io.WriteString(ch, message)
-	}
-	s.pending = nil
-}
-
-func (s *connState) detachSession(ch ssh.Channel) {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-
-	if s.session == ch {
-		s.session = nil
-	}
-}
-
-func (s *connState) showStatus() {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-
-	if s.statusShown || s.session == nil {
-		return
-	}
-	s.statusShown = true
-	_, _ = io.WriteString(s.session, "ssh-vpn tunnel connected. Use -N for forwarding-only sessions.\n")
 }
 
 func bridgeChannels(a ssh.Channel, aReqs <-chan *ssh.Request, b ssh.Channel, bReqs <-chan *ssh.Request) {

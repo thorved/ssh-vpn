@@ -18,6 +18,24 @@ ssh -N -L 8080:localhost:8080 roomname@serverip -p 2222
 
 Traffic sent to `localhost:8080` on Machine B is forwarded to Machine A. Room users remain authentication-free; use network controls when exposing the service.
 
+### Interactive publisher and client dashboards
+
+Use a PTY instead of `-N` to keep the forward and open the role-aware dashboard.
+
+Publisher with dashboard:
+
+```bash
+ssh -t -R 8080:localhost:8080 roomname@serverip -p 2222
+```
+
+Client with dashboard:
+
+```bash
+ssh -t -L 8080:localhost:8080 roomname@serverip -p 2222
+```
+
+The dashboard updates the connection role automatically. Publishers see their owned ports and active clients, can stop a published port, kick a selected client SSH connection, or disconnect themselves. Clients see each active destination, port, peer, and connection age, and can close their selected traffic or disconnect themselves. Multiple TCP channels from the same SSH peer to the same port are grouped into one row with a channel count. A local forward appears as active only while an application is using that forwarded port. Keyboard and mouse controls are both supported.
+
 ## Admin dashboard
 
 The configured admin username requires an authorized public key and opens the dashboard immediately:

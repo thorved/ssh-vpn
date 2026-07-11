@@ -113,14 +113,32 @@ func (m model) toolbar() string {
 
 func (m model) overview(width int) string {
 	t := m.snapshot.Totals
-	cards := []string{
-		metric("ROOMS", t.Rooms, cyan), metric("CONNECTIONS", t.Connections, blue),
-		metric("FORWARDS", t.Publishers, amber), metric("ACTIVE CHANNELS", t.ActiveChannels, pink),
-	}
+	metrics := []struct {
+		label string
+		value int
+		color lipgloss.TerminalColor
+	}{{"ROOMS", t.Rooms, cyan}, {"CONNECTIONS", t.Connections, blue}, {"FORWARDS", t.Publishers, amber}, {"ACTIVE CHANNELS", t.ActiveChannels, pink}}
 	var top string
-	if width >= 100 {
+	if width >= 92 {
+		cardWidth := (width - 4) / 4
+		cards := make([]string, 0, 7)
+		for i, item := range metrics {
+			if i > 0 {
+				cards = append(cards, " ")
+			}
+			cards = append(cards, metric(item.label, item.value, item.color, cardWidth))
+		}
 		top = lipgloss.JoinHorizontal(lipgloss.Top, cards...)
+	} else if width >= 48 {
+		cardWidth := (width - 2) / 2
+		first := lipgloss.JoinHorizontal(lipgloss.Top, metric(metrics[0].label, metrics[0].value, metrics[0].color, cardWidth), " ", metric(metrics[1].label, metrics[1].value, metrics[1].color, cardWidth))
+		second := lipgloss.JoinHorizontal(lipgloss.Top, metric(metrics[2].label, metrics[2].value, metrics[2].color, cardWidth), " ", metric(metrics[3].label, metrics[3].value, metrics[3].color, cardWidth))
+		top = first + "\n" + second
 	} else {
+		cards := make([]string, 0, len(metrics))
+		for _, item := range metrics {
+			cards = append(cards, metric(item.label, item.value, item.color, width-1))
+		}
 		top = strings.Join(cards, "\n")
 	}
 
@@ -142,9 +160,13 @@ func (m model) overview(width int) string {
 	return strings.Join(lines, "\n")
 }
 
-func metric(label string, value int, color lipgloss.TerminalColor) string {
-	return lipgloss.NewStyle().Border(lipgloss.RoundedBorder()).BorderForeground(border).Padding(0, 2).Width(19).
-		Render(lipgloss.NewStyle().Foreground(color).Bold(true).Render(fmt.Sprintf("%-4d", value)) + " " + mutedStyle.Render(label))
+func metric(label string, value int, color lipgloss.TerminalColor, width int) string {
+	content := lipgloss.NewStyle().Foreground(color).Bold(true).Render(fmt.Sprintf("%d", value)) + "  " + mutedStyle.Render(label)
+	minimum := lipgloss.Width(content) + 4
+	if width < minimum {
+		width = minimum
+	}
+	return lipgloss.NewStyle().Border(lipgloss.RoundedBorder()).BorderForeground(color).Padding(0, 1).Width(width - 2).Height(1).Render(content)
 }
 
 func (m model) rooms(width, height int) string {

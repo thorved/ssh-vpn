@@ -7,6 +7,7 @@ import (
 	"time"
 
 	tea "github.com/charmbracelet/bubbletea"
+	"github.com/charmbracelet/lipgloss"
 	"github.com/thorved/ssh-vpn/backend/internal/admin"
 )
 
@@ -61,6 +62,22 @@ func TestModelActionAndResize(t *testing.T) {
 	}
 	if !strings.Contains(m.View(), "\x1b[38;5;") {
 		t.Fatal("dashboard did not render ANSI-256 foreground colors")
+	}
+}
+
+func TestMetricCardsStaySingleLine(t *testing.T) {
+	card := metric("ACTIVE CHANNELS", 12, pink, 24)
+	if lines := strings.Count(card, "\n") + 1; lines != 3 {
+		t.Fatalf("metric card wrapped to %d lines:\n%s", lines, card)
+	}
+}
+
+func TestOverviewNeverUsesLastTerminalColumn(t *testing.T) {
+	m := newModel(&fakeStore{snapshot: sampleSnapshot()}, make(chan struct{}), 118, 30)
+	for _, line := range strings.Split(m.overview(118), "\n") {
+		if got := lipgloss.Width(line); got >= 118 {
+			t.Fatalf("overview line reaches or exceeds terminal edge: width=%d\n%s", got, line)
+		}
 	}
 }
 
